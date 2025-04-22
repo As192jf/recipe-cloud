@@ -1,102 +1,101 @@
-// Konfiguration über Environment Variables in Cloudflare
-const BOT_TOKEN = YOUR_BOT_TOKEN; // In Cloudflare Workers als Secret setzen
-const AUTHORIZED_USERS = YOUR_AUTHORIZED_USERS.split(",").map(Number); // z.B. "123456789,987654321"
+/**
+ * https://github.com/cvzi/telegram-bot-cloudflare
+ */
 
-// Handler für Telegram Updates
-async function handleTelegramUpdate(update) {
-  // Inline Query verarbeiten
-  if (update.inline_query) {
-    const query = update.inline_query;
-    const user = query.from;
-    const userId = user.id;
-    const username = user.username || user.first_name;
-    const queryText = query.query.trim();
+const TOKEN = ENV_BOT_TOKEN // Get it from @BotFather https://core.telegram.org/bots#6-botfather
+const WEBHOOK = '/endpoint'
+const SECRET = ENV_BOT_SECRET // A-Z, a-z, 0-9, _ and -
 
-    // Prüfe Autorisisierung
-    if (!AUTHORIZED_USERS.includes(userId)) {
-      console.log(`Unauthorized user: ${username} (${userId})`);
-      return new Response('Unauthorized', { status: 401 });
-    }
+/**
+ * Wait for requests to the worker
+ */
+addEventListener('fetch', event => {
+  const url = new URL(event.request.url)
+  if (url.pathname === WEBHOOK) {
+    event.respondWith(handleWebhook(event))
+  } else if (url.pathname === '/registerWebhook') {
+    event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET))
+  } else if (url.pathname === '/unRegisterWebhook') {
+    event.respondWith(unRegisterWebhook(event))
+  } else {
+    event.respondWith(new Response('No handler for this request'))
+  }
+})
 
-    // Prüfe ob URL
-    if (!queryText.startsWith('http')) {
-      console.log(`Invalid query from ${username}: ${queryText}`);
-      return new Response('Invalid query', { status: 400 });
-    }
-
-    // Bring URL erstellen
-    const encodedUrl = encodeURIComponent(queryText);
-    const bringUrl = `https://api.getbring.com/rest/bringrecipes/deeplink?url=${encodedUrl}&source=telegram&baseQuantity=4&requestedQuantity=4`;
-
-    // Inline Query Antwort vorbereiten
-    const answerPayload = {
-      inline_query_id: query.id,
-      results: [{
-        type: 'article',
-        id: crypto.randomUUID(),
-        title: 'Rezept übertragen',
-        input_message_content: {
-          message_text: `<a href="${bringUrl}">Rezept übertragen.</a>`,
-          parse_mode: 'HTML'
-        },
-        description: 'Klickbarer Bring!-Link'
-      }],
-      cache_time: 0
-    };
-
-    // Antwort an Telegram senden
-    return await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerInlineQuery`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(answerPayload)
-    });
+/**
+ * Handle requests to WEBHOOK
+ * https://core.telegram.org/bots/api#update
+ */
+async function handleWebhook (event) {
+  // Check secret
+  if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
+    return new Response('Unauthorized', { status: 403 })
   }
 
-  // Start Command verarbeiten
-  if (update.message && update.message.text === '/start') {
-    const chatId = update.message.chat.id;
-    const messagePayload = {
-      chat_id: chatId,
-      text: "Bot läuft und ist bereit für Inline-Anfragen!"
-    };
+  // Read request body synchronously
+  const update = await event.request.json()
+  // Deal with response asynchronously
+  event.waitUntil(onUpdate(update))
 
-    return await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(messagePayload)
-    });
-  }
-
-  return new Response('OK', { status: 200 });
+  return new Response('Ok')
 }
 
-// Hauptfunktion des Workers
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
-
-async function handleRequest(request) {
-  // Ping Route
-  if (request.url.endsWith('/ping')) {
-    return new Response('pong', {
-      headers: { 'Content-Type': 'text/plain' }
-    });
+/**
+ * Handle incoming Update
+ * https://core.telegram.org/bots/api#update
+ */
+async function onUpdate (update) {
+  if ('message' in update) {
+    await onMessage(update.message)
   }
+}
 
-  // Webhook Route
-  if (request.method === 'POST') {
-    try {
-      const update = await request.json();
-      return await handleTelegramUpdate(update);
-    } catch (error) {
-      console.error('Error processing update:', error);
-      return new Response('Error', { status: 500 });
-    }
+/**
+ * Handle incoming Message
+ * https://core.telegram.org/bots/api#message
+ */
+function onMessage (message) {
+  return sendPlainText(message.chat.id, 'Echo:\n' + message.text)
+}
+
+/**
+ * Send plain text message
+ * https://core.telegram.org/bots/api#sendmessage
+ */
+async function sendPlainText (chatId, text) {
+  return (await fetch(apiUrl('sendMessage', {
+    chat_id: chatId,
+    text
+  }))).json()
+}
+
+/**
+ * Set webhook to this worker's url
+ * https://core.telegram.org/bots/api#setwebhook
+ */
+async function registerWebhook (event, requestUrl, suffix, secret) {
+  // https://core.telegram.org/bots/api#setwebhook
+  const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`
+  const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))).json()
+  return new Response('ok' in r && r.ok ? 'Ok' : JSON.stringify(r, null, 2))
+}
+
+/**
+ * Remove webhook
+ * https://core.telegram.org/bots/api#setwebhook
+ */
+async function unRegisterWebhook (event) {
+  const r = await (await fetch(apiUrl('setWebhook', { url: '' }))).json()
+  return new Response('ok' in r && r.ok ? 'Ok' : JSON.stringify(r, null, 2))
+}
+
+/**
+ * Return url to telegram api, optionally with parameters added
+ */
+function apiUrl (methodName, params = null) {
+  let query = ''
+  if (params) {
+    query = '?' + new URLSearchParams(params).toString()
   }
-
-  return new Response('Method not allowed', { status: 405 });
+  return `https://api.telegram.org/bot${TOKEN}/${methodName}${query}`
 }
